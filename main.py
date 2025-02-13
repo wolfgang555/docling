@@ -136,45 +136,74 @@ async def convert_document_endpoint(request: ConversionRequest = Body(...)):
         logger.error(f"Error in convert endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/status/{task_id}", response_model=ConversionStatus)
-async def get_conversion_status(task_id: str):
-    if task_id not in conversion_tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    task = conversion_tasks[task_id]
-    return ConversionStatus(
-        task_id=task_id,
-        status=task["status"],
-        result=task.get("result"),
-        error=task.get("error"),
-        progress=task.get("progress"),
-        start_time=task.get("start_time")
-    )
-
 @app.get("/result/{task_id}")
-@cache(expire=3600)  # 缓存1小时
 async def get_conversion_result(task_id: str):
+    """
+    统一的任务结果获取接口：
+    - 如果任务完成，返回转换结果
+    - 如果任务进行中，返回任务状态
+    - 如果任务失败，返回错误信息
+    """
     if task_id not in conversion_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
     task = conversion_tasks[task_id]
-    if task["status"] != "completed":
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Task not completed. Current status: {task['status']}, Progress: {task.get('progress')}"
-        )
     
-    result_path = task.get("result")
-    if not result_path or not os.path.exists(result_path):
-        raise HTTPException(status_code=404, detail="Result file not found")
+    # 基础响应结构
+    response = {
+        "status": task["status"],
+        "progress": task.get("progress", "Processing"),
+        "error": task.get("error"),
+        "start_time": task.get("start_time"),
+        "result": None
+    }
     
-    try:
-        with open(result_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return PlainTextResponse(content)
-    except Exception as e:
-        logger.error(f"Failed to read result file: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to read result file")
+    # 根据任务状态返回不同的响应
+    if task["status"] == "completed":
+        result_path = task.get("result")
+        if not result_path or not os.path.exists(result_path):
+            raise HTTPException(status_code=404, detail="Result file not found")
+        
+        try:
+            with open(result_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # 根据文件扩展名处理结果
+            file_ext = os.path.splitext(result_path)[1].lower()
+            if file_ext == '.json':
+                try:
+                    # 如果是 JSON 格式，解析为对象
+                    response["result"] = json.loads(content)
+                except json.JSONDecodeError:
+                    # 如果解析失败，返回原始内容
+                    response["result"] = content
+            elif file_ext in ['.markdown', '.md']:
+                # Markdown 格式，保持原样
+                response["result"] = content
+            else:
+                # 其他格式（如 .txt），也保持原样
+                response["result"] = content
+                
+            return JSONResponse(
+                status_code=200,
+                content=response
+            )
+        except Exception as e:
+            logger.error(f"Failed to read result file: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to read result file")
+    
+    # 任务未完成或失败时返回状态信息
+    return JSONResponse(
+        status_code=202 if task["status"] in ["pending", "processing"] else 500,
+        content={
+            **response,
+            "message": (
+                "Task is still processing. Please try again later."
+                if task["status"] in ["pending", "processing"]
+                else task.get("error", "Task failed")
+            )
+        }
+    )
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -209,7 +238,6 @@ async def universal_exception_handler(request: Request, exc: Exception):
             type="http_error"
         )
     elif isinstance(exc, RequestValidationError):
-        # 让验证错误由专门的处理器处理
         raise exc
     else:
         error_detail = ErrorDetail(
@@ -219,7 +247,7 @@ async def universal_exception_handler(request: Request, exc: Exception):
     
     return JSONResponse(
         status_code=getattr(exc, 'status_code', 500),
-        content={"detail": error_detail.dict(exclude_none=True)}
+        content={"detail": error_detail.model_dump(exclude_none=True)}
     )
 
 @app.post("/upload", response_model=ConversionStatus)
