@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, HTTPException, File, Request, Body
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from typing import Optional, Dict, Union, List
 import aiohttp
 import asyncio
@@ -29,6 +29,7 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import psutil
 import json
+from contextlib import asynccontextmanager
 
 # 系统配置
 OUTPUT_DIRECTORY = os.getenv('DOCLING_OUTPUT_DIR', 'temp')
@@ -41,7 +42,17 @@ REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 # 添加内存使用限制
 MEMORY_LIMIT_PERCENT = 80  # 最大使用80%的系统内存
 
-app = FastAPI(title="Document Conversion Service")
+# 使用 lifespan 替代 on_event
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时执行
+    redis = aioredis.from_url(REDIS_URL, encoding="utf8", decode_responses=True)
+    FastAPICache.init(RedisBackend(redis), prefix="docling-cache:")
+    yield
+    # 关闭时执行
+    await redis.close()
+
+app = FastAPI(title="Document Conversion Service", lifespan=lifespan)
 
 # 存储转换任务的状态
 conversion_tasks: Dict[str, dict] = {}
@@ -61,17 +72,17 @@ class ConversionRequest(BaseModel):
     table_mode: str = "fast"  # "fast" 或 "accurate"
     max_pages: Optional[int] = None  # 最大页数限制
 
-    @validator('target_format')
+    @field_validator('target_format')
     def validate_format(cls, v):
         allowed_formats = {'markdown', 'text', 'json'}
         if v.lower() not in allowed_formats:
             raise ValueError(f"Unsupported format. Allowed formats: {', '.join(allowed_formats)}")
         return v.lower()
     
-    @validator('table_mode')
+    @field_validator('table_mode')
     def validate_table_mode(cls, v):
         if v not in ['fast', 'accurate']:
-            raise ValueError("table_mode must be either 'fast' or 'accurate'")
+            raise ValueError("Table mode must be either 'fast' or 'accurate'")
         return v
 
 class ConversionStatus(BaseModel):
@@ -96,11 +107,6 @@ class ProgressTracker:
         conversion_tasks[self.task_id].update({
             "progress": f"{message} ({progress}%)"
         })
-
-@app.on_event("startup")
-async def startup():
-    redis = aioredis.from_url(REDIS_URL, encoding="utf8", decode_responses=True)
-    FastAPICache.init(RedisBackend(redis), prefix="docling-cache:")
 
 @app.post("/convert", response_model=ConversionStatus)
 async def convert_document_endpoint(request: ConversionRequest = Body(...)):
