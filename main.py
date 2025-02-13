@@ -112,7 +112,7 @@ class ProgressTracker:
 async def convert_document_endpoint(request: ConversionRequest = Body(...)):
     try:
         task_id = str(uuid.uuid4())
-        logger.info(f"Received conversion request: {request.dict()}")
+        logger.info(f"Received conversion request: {request.model_dump()}")
         
         conversion_tasks[task_id] = {
             "status": "pending",
